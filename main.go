@@ -21,8 +21,9 @@ func main() {
 	// 1. Parse Flags and Commands
 	var filePaths []string
 	appendMode := false
-	includeIgnored := false // NEW: include ignored files when true
-	command := ""           // "" (default), "clear", or "write"
+	prependMode := false // [NEW]
+	includeIgnored := false
+	command := ""
 	writeTarget := ""
 
 	skipNext := false
@@ -36,12 +37,14 @@ func main() {
 		case "--append":
 			appendMode = true
 			continue
+		case "--prepend": // [NEW]
+			prependMode = true
+			continue
 		case "--includeIgnore":
 			includeIgnored = true
 			continue
 		}
 
-		// Check for subcommands (only if it's the first non-flag argument)
 		if command == "" && len(filePaths) == 0 {
 			if arg == "clear" {
 				command = "clear"
@@ -89,14 +92,12 @@ func main() {
 	}
 
 	// 3. Default Behavior: Pull files to clipboard
-
-	// Load .gitignore once (based on current working directory)
 	repoRoot, ign := loadGitIgnoreForCWD()
-	_ = repoRoot // used by ignore checks
+	_ = repoRoot
 
 	var sb strings.Builder
 
-	// If appending, read current clipboard first
+	// [EXISTING] Handle Append: Pre-fill builder with current clipboard
 	if appendMode {
 		current, err := clipboard.ReadAll()
 		if err == nil {
@@ -107,43 +108,60 @@ func main() {
 		}
 	}
 
-	for _, path := range filePaths {
-		info, err := os.Stat(path)
-		if err != nil {
-			fmt.Printf("Skipping %s: %v\n", path, err)
-			continue
+	// [NEW] Handle Prepend: Read clipboard now, attach it at the end later
+	var previousContent string
+	if prependMode {
+		c, err := clipboard.ReadAll()
+		if err == nil {
+			previousContent = c
 		}
+	}
 
-		if info.IsDir() {
-			// Pull all files in directory (non-recursive)
-			entries, err := os.ReadDir(path)
+	for _, startPath := range filePaths {
+		// Use WalkDir for recursion
+		err := filepath.WalkDir(startPath, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
-				fmt.Printf("Error reading dir %s: %v\n", path, err)
-				continue
+				// If we can't access a specific path, print error but continue walking others
+				fmt.Printf("Skipping %s: %v\n", path, err)
+				return nil
 			}
-			for _, entry := range entries {
-				if entry.IsDir() {
-					continue
-				}
-				fullPath := filepath.Join(path, entry.Name())
 
-				// Respect .gitignore by default
-				if !includeIgnored && isIgnored(repoRoot, ign, fullPath) {
-					continue
-				}
-
-				processFile(fullPath, &sb)
-			}
-		} else {
-			// Respect .gitignore by default
+			// Check .gitignore
 			if !includeIgnored && isIgnored(repoRoot, ign, path) {
-				continue
+				if d.IsDir() {
+					// Optimization: If the directory itself is ignored (e.g. node_modules),
+					// skip the entire directory tree.
+					return filepath.SkipDir
+				}
+				return nil
 			}
+
+			// If it's a directory, we just continue (we only process files)
+			if d.IsDir() {
+				return nil
+			}
+
+			// Process the file
 			processFile(path, &sb)
+			return nil
+		})
+
+		if err != nil {
+			fmt.Printf("Error walking %s: %v\n", startPath, err)
 		}
 	}
 
 	finalContent := sb.String()
+
+	// [NEW] Apply Prepend Logic
+	// Result = New Content (sb) + Old Content (previousContent)
+	if prependMode && previousContent != "" {
+		if finalContent != "" && !strings.HasSuffix(finalContent, "\n") {
+			finalContent += "\n"
+		}
+		finalContent += previousContent
+	}
+
 	if err := clipboard.WriteAll(finalContent); err != nil {
 		fmt.Printf("Error writing to clipboard: %v\n", err)
 		os.Exit(1)
@@ -156,7 +174,6 @@ func processFile(path string, sb *strings.Builder) {
 	// Resolve absolute path for the header
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		// Fallback to relative path if absolute fails for some reason
 		absPath = path
 	}
 
@@ -192,17 +209,17 @@ func processFile(path string, sb *strings.Builder) {
 
 func printUsage() {
 	fmt.Println("Usage:")
-	fmt.Println("  pull <file/dir> ...           Pull content to clipboard (respects .gitignore by default)")
+	fmt.Println("  pull <file/dir> ...           Pull content to clipboard (recursive)")
 	fmt.Println("  pull clear                    Clear clipboard")
 	fmt.Println("  pull write <file>             Write clipboard to file")
 	fmt.Println("Flags:")
 	fmt.Println("  --append                      Append to clipboard instead of overwrite")
+	fmt.Println("  --prepend                     Prepend to clipboard instead of overwrite")
 	fmt.Println("  --includeIgnore               Include files that are ignored by .gitignore")
 }
 
 // loadGitIgnoreForCWD finds a repo-ish root (nearest parent with .git or .gitignore)
 // and loads patterns from <root>/.gitignore if present.
-// If not found or not loadable, it returns a nil matcher.
 func loadGitIgnoreForCWD() (root string, ign *gitignore.GitIgnore) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -220,14 +237,9 @@ func loadGitIgnoreForCWD() (root string, ign *gitignore.GitIgnore) {
 			return root, m
 		}
 	}
-
-	// No .gitignore file (or failed to parse)
 	return root, nil
 }
 
-// findRepoRoot walks upward from start looking for a directory that contains
-// either a ".git" directory or a ".gitignore" file.
-// If none found, returns error.
 func findRepoRoot(start string) (string, error) {
 	start = filepath.Clean(start)
 	if es, err := filepath.EvalSymlinks(start); err == nil {
@@ -258,9 +270,6 @@ func existsFile(p string) bool {
 	return err == nil && !st.IsDir()
 }
 
-// isIgnored returns true if path is matched by the loaded .gitignore matcher.
-// If matcher is nil, returns false.
-// If path is outside repoRoot, returns false.
 func isIgnored(repoRoot string, ign *gitignore.GitIgnore, path string) bool {
 	if ign == nil || repoRoot == "" {
 		return false
@@ -280,13 +289,10 @@ func isIgnored(repoRoot string, ign *gitignore.GitIgnore, path string) bool {
 		return false
 	}
 
-	// If rel starts with "..", it's outside the root — don't ignore.
 	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return false
 	}
 
-	// Gitignore patterns use forward slashes.
 	rel = filepath.ToSlash(rel)
-
 	return ign.MatchesPath(rel)
 }

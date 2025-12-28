@@ -105,6 +105,7 @@ Append a directory’s content to whatever is already on your clipboard:
 
 ```bash
 pull --append ./pkg
+pull --prepend ./pkg
 ```
 
 Clear clipboard:
