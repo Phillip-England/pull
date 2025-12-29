@@ -21,7 +21,7 @@ func main() {
 	// 1. Parse Flags and Commands
 	var filePaths []string
 	appendMode := false
-	prependMode := false // [NEW]
+	prependMode := false
 	includeIgnored := false
 	command := ""
 	writeTarget := ""
@@ -37,7 +37,7 @@ func main() {
 		case "--append":
 			appendMode = true
 			continue
-		case "--prepend": // [NEW]
+		case "--prepend":
 			prependMode = true
 			continue
 		case "--includeIgnore":
@@ -48,6 +48,10 @@ func main() {
 		if command == "" && len(filePaths) == 0 {
 			if arg == "clear" {
 				command = "clear"
+				continue
+			}
+			if arg == "emit" { // [NEW] Command to pipe to stdout
+				command = "emit"
 				continue
 			}
 			if arg == "write" {
@@ -71,6 +75,16 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("Clipboard cleared.")
+		return
+
+	case "emit": // [NEW] Logic for emit
+		content, err := clipboard.ReadAll()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading clipboard: %v\n", err)
+			os.Exit(1)
+		}
+		// Print to stdout exactly as is, so it can be piped
+		fmt.Print(content)
 		return
 
 	case "write":
@@ -108,7 +122,7 @@ func main() {
 		}
 	}
 
-	// [NEW] Handle Prepend: Read clipboard now, attach it at the end later
+	// [EXISTING] Handle Prepend: Read clipboard now, attach it at the end later
 	var previousContent string
 	if prependMode {
 		c, err := clipboard.ReadAll()
@@ -153,7 +167,7 @@ func main() {
 
 	finalContent := sb.String()
 
-	// [NEW] Apply Prepend Logic
+	// Apply Prepend Logic
 	// Result = New Content (sb) + Old Content (previousContent)
 	if prependMode && previousContent != "" {
 		if finalContent != "" && !strings.HasSuffix(finalContent, "\n") {
@@ -210,6 +224,7 @@ func processFile(path string, sb *strings.Builder) {
 func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  pull <file/dir> ...           Pull content to clipboard (recursive)")
+	fmt.Println("  pull emit                     Print clipboard content to stdout")
 	fmt.Println("  pull clear                    Clear clipboard")
 	fmt.Println("  pull write <file>             Write clipboard to file")
 	fmt.Println("Flags:")

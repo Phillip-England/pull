@@ -120,6 +120,11 @@ Write clipboard to a new file:
 pull write ./notes.txt
 ```
 
+Emit Clipboard to stdout:
+```bash
+pull emit
+```
+
 ---
 
 ## Exit codes / behavior
