@@ -1,149 +1,166 @@
-# pull — copy files to clipboard (and write clipboard back)
+# pull
 
-`pull` is a tiny CLI that:
+`pull` is a clipboard-first CLI tool for collecting content from files, directories, or URLs and moving it instantly into your clipboard (or stdout).
 
-- **Copies one or more files (or all files in a directory) to your clipboard**
-- **Optionally appends** to what’s already on your clipboard (`--append`)
-- **Clears** your clipboard (`pull clear`)
-- **Writes** your clipboard contents into a file (`pull write <path>`)
--- **Ignores** files in your `.gitignore`
+It is designed for:
+- AI / LLM workflows
+- Static-site tooling
+- Rapid iteration and inspection
+- Fast “grab → paste → think” development loops
 
-It’s designed for quick “grab file content → paste somewhere” workflows.
+> Think: `cat`, `curl`, and your clipboard — deliberately opinionated.
 
 ---
 
-## Install (Go)
+## Features
 
-You can install with `go install` (Go 1.18+):
+- 📋 Clipboard-first by default
+- 📁 Recursively pull files and directories
+- 🌐 Fetch web pages via simple HTTP (`href`)
+- 🚫 Honors `.gitignore` automatically
+- ➕ Append or prepend instead of overwriting
+- 🔄 Pipe clipboard content to stdout
+- ✍️ Write clipboard contents directly to a file
+
+---
+
+## Installation
+
+### Using Go
 
 ```bash
 go install github.com/phillip-england/pull@latest
 ```
 
-Replace `<MODULE_PATH>` with the module path for this repository (for example: `github.com/yourname/pull`).
-
-After installing, make sure your Go bin directory is in your `PATH`:
+### From source
 
 ```bash
-export PATH="$(go env GOPATH)/bin:$PATH"
+git clone https://github.com/phillip-england/pull
+cd pull
+go build
 ```
-
-Verify:
-
-```bash
-pull
-```
-
-> **macOS note:** Clipboard access may require permission prompts depending on how/where you run the binary (Terminal, iTerm, etc.). If clipboard operations fail, check **System Settings → Privacy & Security → Clipboard**.
 
 ---
 
 ## Usage
 
-### Copy files/directories to clipboard
+### Pull files or directories into the clipboard
 
 ```bash
-pull <file_or_dir> [more_files_or_dirs...]
+pull main.go
+pull src/
+pull src cmd internal
 ```
 
-- If you pass a **file**, it’s processed line-by-line.
-- If you pass a **directory**, it processes **all files in that directory (non-recursive)**.
-- Output is written to the clipboard and prefixed with a header per file:
+Behavior:
+- Recurses through directories
+- Removes empty lines and comments
+- Adds file headers for clarity
 
-```
-file: /absolute/path/to/file
-<filtered content...>
-```
+---
 
-### Append instead of overwrite
+### Respecting `.gitignore`
+
+By default, ignored files (such as `node_modules`, `dist`, etc.) are skipped.
+
+To include them:
 
 ```bash
-pull --append <file_or_dir> ...
-```
-
-### Clear clipboard
-
-```bash
-pull clear
-```
-
-### Write clipboard contents to a file
-
-```bash
-pull write ./some_file.txt
+pull --includeIgnore src/
 ```
 
 ---
 
-## Filtering behavior
+### Fetch web pages (`href`)
 
-When copying to the clipboard, `pull`:
+Fetch one or more URLs and copy the response body into the clipboard.
 
-- **Removes empty lines**
-- **Removes comment-only lines** that begin with `//` or `#` (after trimming whitespace)
-- Preserves other lines exactly (including indentation)
+```bash
+pull href github.com/phillip-england
+pull href https://example.com
+```
 
-This is useful for copying “just the meaningful content” out of source files.
+Notes:
+- Automatically prepends `https://` if missing
+- Performs a simple `GET` request
+- **Non-2xx HTTP responses return an error**
+- Response size is capped for safety
+
+Multiple URLs:
+
+```bash
+pull href github.com/phillip-england example.com docs.bun.sh
+```
+
+---
+
+### Append or prepend instead of overwrite
+
+Append new content to what’s already in the clipboard:
+
+```bash
+pull --append src/
+pull --append href example.com
+```
+
+Prepend new content:
+
+```bash
+pull --prepend main.go
+```
+
+---
+
+### Emit clipboard to stdout
+
+Useful for piping, inspection, or transformation:
+
+```bash
+pull emit
+pull emit | sed 's/foo/bar/'
+```
+
+---
+
+### Write clipboard contents to a file
+
+```bash
+pull write output.txt
+```
+
+Writes the clipboard contents exactly as-is.
 
 ---
 
 ## Examples
 
-Copy two files:
+Pull source code and a webpage into the same clipboard payload:
 
 ```bash
-pull ./main.go ./go.mod
+pull src/
+pull --append href example.com
 ```
 
-Copy all files in a directory (non-recursive):
+Use `pull` to quickly assemble AI prompts:
 
 ```bash
-pull ./pkg
-```
-
-Append a directory’s content to whatever is already on your clipboard:
-
-```bash
-pull --append ./pkg
-pull --prepend ./pkg
-```
-
-Clear clipboard:
-
-```bash
-pull clear
-```
-
-Write clipboard to a new file:
-
-```bash
-pull write ./notes.txt
-```
-
-Emit Clipboard to stdout:
-```bash
-pull emit
+pull src/handlers api/routes
+pull emit | llm
 ```
 
 ---
 
-## Exit codes / behavior
+## Philosophy
 
-- Skips missing paths and prints a message like:
-  - `Skipping <path>: <error>`
-- Exits with code `1` on clipboard read/write failures or write-to-file failures.
-- Prints `Copied to clipboard!` on success.
+`pull` is intentionally simple:
+- No config files
+- No background processes
+- No hidden state
 
----
-
-## Dependencies
-
-This tool uses the cross-platform clipboard library:
-
-- `github.com/atotto/clipboard`
+It does one thing well: **move useful content into your clipboard, fast**.
 
 ---
 
 ## License
 
-Add your preferred license (MIT, Apache-2.0, etc.) to the repository root.
+MIT License © Phillip England

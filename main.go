@@ -2,13 +2,22 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/atotto/clipboard"
 	gitignore "github.com/sabhiram/go-gitignore"
+)
+
+const (
+	// Safety limit so you don’t accidentally slam your clipboard with a 200MB response.
+	maxFetchBytes = 5 << 20 // 5 MiB
 )
 
 func main() {
@@ -50,7 +59,7 @@ func main() {
 				command = "clear"
 				continue
 			}
-			if arg == "emit" { // [NEW] Command to pipe to stdout
+			if arg == "emit" {
 				command = "emit"
 				continue
 			}
@@ -60,6 +69,10 @@ func main() {
 					writeTarget = args[i+1]
 					skipNext = true
 				}
+				continue
+			}
+			if arg == "href" {
+				command = "href"
 				continue
 			}
 		}
@@ -77,13 +90,12 @@ func main() {
 		fmt.Println("Clipboard cleared.")
 		return
 
-	case "emit": // [NEW] Logic for emit
+	case "emit":
 		content, err := clipboard.ReadAll()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading clipboard: %v\n", err)
 			os.Exit(1)
 		}
-		// Print to stdout exactly as is, so it can be piped
 		fmt.Print(content)
 		return
 
@@ -103,15 +115,84 @@ func main() {
 		}
 		fmt.Printf("Clipboard content written to %s\n", writeTarget)
 		return
+
+	case "href":
+		if len(filePaths) == 0 {
+			fmt.Println("Error: Missing URL(s). Usage: pull href <url> [url2 ...]")
+			os.Exit(1)
+		}
+
+		final, err := buildWithClipboardModes(appendMode, prependMode, func(sb *strings.Builder) error {
+			for _, raw := range filePaths {
+				u := normalizeURL(raw)
+				if err := fetchIntoBuilder(u, sb); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+
+		if err := clipboard.WriteAll(final); err != nil {
+			fmt.Printf("Error writing to clipboard: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Copied to clipboard!")
+		return
 	}
 
 	// 3. Default Behavior: Pull files to clipboard
 	repoRoot, ign := loadGitIgnoreForCWD()
 	_ = repoRoot
 
+	final, err := buildWithClipboardModes(appendMode, prependMode, func(sb *strings.Builder) error {
+		for _, startPath := range filePaths {
+			err := filepath.WalkDir(startPath, func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					fmt.Printf("Skipping %s: %v\n", path, err)
+					return nil
+				}
+
+				if !includeIgnored && isIgnored(repoRoot, ign, path) {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+
+				if d.IsDir() {
+					return nil
+				}
+
+				processFile(path, sb)
+				return nil
+			})
+
+			if err != nil {
+				fmt.Printf("Error walking %s: %v\n", startPath, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
+	if err := clipboard.WriteAll(final); err != nil {
+		fmt.Printf("Error writing to clipboard: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Copied to clipboard!")
+}
+
+func buildWithClipboardModes(appendMode, prependMode bool, writeNewContent func(sb *strings.Builder) error) (string, error) {
 	var sb strings.Builder
 
-	// [EXISTING] Handle Append: Pre-fill builder with current clipboard
+	// Append: pre-fill builder with current clipboard
 	if appendMode {
 		current, err := clipboard.ReadAll()
 		if err == nil {
@@ -122,7 +203,7 @@ func main() {
 		}
 	}
 
-	// [EXISTING] Handle Prepend: Read clipboard now, attach it at the end later
+	// Prepend: read clipboard now, attach it at the end later
 	var previousContent string
 	if prependMode {
 		c, err := clipboard.ReadAll()
@@ -131,44 +212,13 @@ func main() {
 		}
 	}
 
-	for _, startPath := range filePaths {
-		// Use WalkDir for recursion
-		err := filepath.WalkDir(startPath, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				// If we can't access a specific path, print error but continue walking others
-				fmt.Printf("Skipping %s: %v\n", path, err)
-				return nil
-			}
-
-			// Check .gitignore
-			if !includeIgnored && isIgnored(repoRoot, ign, path) {
-				if d.IsDir() {
-					// Optimization: If the directory itself is ignored (e.g. node_modules),
-					// skip the entire directory tree.
-					return filepath.SkipDir
-				}
-				return nil
-			}
-
-			// If it's a directory, we just continue (we only process files)
-			if d.IsDir() {
-				return nil
-			}
-
-			// Process the file
-			processFile(path, &sb)
-			return nil
-		})
-
-		if err != nil {
-			fmt.Printf("Error walking %s: %v\n", startPath, err)
-		}
+	if err := writeNewContent(&sb); err != nil {
+		return "", err
 	}
 
 	finalContent := sb.String()
 
-	// Apply Prepend Logic
-	// Result = New Content (sb) + Old Content (previousContent)
+	// Apply Prepend Logic: New Content + Old Content
 	if prependMode && previousContent != "" {
 		if finalContent != "" && !strings.HasSuffix(finalContent, "\n") {
 			finalContent += "\n"
@@ -176,22 +226,74 @@ func main() {
 		finalContent += previousContent
 	}
 
-	if err := clipboard.WriteAll(finalContent); err != nil {
-		fmt.Printf("Error writing to clipboard: %v\n", err)
-		os.Exit(1)
+	return finalContent, nil
+}
+
+func fetchIntoBuilder(url string, sb *strings.Builder) error {
+	client := &http.Client{
+		Timeout: 15 * time.Second,
 	}
 
-	fmt.Println("Copied to clipboard!")
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("href: invalid url %q: %w", url, err)
+	}
+	req.Header.Set("User-Agent", "pull/1.0 (+clipboard)")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("href: request failed for %q: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return fmt.Errorf("href: bad status for %q: %s", url, resp.Status)
+	}
+
+	body, err := readUpTo(resp.Body, maxFetchBytes)
+	if err != nil {
+		return fmt.Errorf("href: reading body for %q failed: %w", url, err)
+	}
+
+	// Header separator for fetched pages
+	sb.WriteString(fmt.Sprintf("href: %s\n", url))
+	sb.WriteString(string(body))
+	if len(body) > 0 && body[len(body)-1] != '\n' {
+		sb.WriteString("\n")
+	}
+	return nil
+}
+
+func readUpTo(r io.Reader, max int64) ([]byte, error) {
+	lr := &io.LimitedReader{R: r, N: max + 1}
+	b, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, errors.New("response too large (exceeds maxFetchBytes)")
+	}
+	return b, nil
+}
+
+func normalizeURL(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	// Accept github.com/foo or example.com/path without scheme.
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return s
+	}
+	return "https://" + s
 }
 
 func processFile(path string, sb *strings.Builder) {
-	// Resolve absolute path for the header
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		absPath = path
 	}
 
-	// Add the file separator
 	sb.WriteString(fmt.Sprintf("file: %s\n", absPath))
 
 	file, err := os.Open(path)
@@ -206,12 +308,10 @@ func processFile(path string, sb *strings.Builder) {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 
-		// Remove empty lines
 		if len(trimmed) == 0 {
 			continue
 		}
 
-		// Remove comments (// and #)
 		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
@@ -224,6 +324,7 @@ func processFile(path string, sb *strings.Builder) {
 func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  pull <file/dir> ...           Pull content to clipboard (recursive)")
+	fmt.Println("  pull href <url> [url2 ...]    Fetch URL(s) and copy response to clipboard")
 	fmt.Println("  pull emit                     Print clipboard content to stdout")
 	fmt.Println("  pull clear                    Clear clipboard")
 	fmt.Println("  pull write <file>             Write clipboard to file")
