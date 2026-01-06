@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,16 +41,16 @@ func main() {
 	appendMode := false
 	prependMode := false
 	includeIgnored := false
+	sampleMode := false
+	sampleMin := 2
+	sampleMax := 3
+	sampleMinSet := false
+	sampleMaxSet := false
 	command := ""
 	writeTarget := ""
 
-	skipNext := false
-	for i, arg := range args {
-		if skipNext {
-			skipNext = false
-			continue
-		}
-
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		switch arg {
 		case "--append":
 			appendMode = true
@@ -57,6 +60,62 @@ func main() {
 			continue
 		case "--includeIgnore":
 			includeIgnored = true
+			continue
+		case "--sample":
+			sampleMode = true
+			continue
+		case "--sample-min":
+			if i+1 >= len(args) {
+				fmt.Println("Error: Missing value for --sample-min")
+				os.Exit(1)
+			}
+			v, err := parseSampleValue(args[i+1], "--sample-min")
+			if err != nil {
+				fmt.Println(err.Error())
+				os.Exit(1)
+			}
+			sampleMin = v
+			sampleMinSet = true
+			sampleMode = true
+			i++
+			continue
+		case "--sample-max":
+			if i+1 >= len(args) {
+				fmt.Println("Error: Missing value for --sample-max")
+				os.Exit(1)
+			}
+			v, err := parseSampleValue(args[i+1], "--sample-max")
+			if err != nil {
+				fmt.Println(err.Error())
+				os.Exit(1)
+			}
+			sampleMax = v
+			sampleMaxSet = true
+			sampleMode = true
+			i++
+			continue
+		}
+
+		if strings.HasPrefix(arg, "--sample-min=") {
+			v, err := parseSampleValue(strings.TrimPrefix(arg, "--sample-min="), "--sample-min")
+			if err != nil {
+				fmt.Println(err.Error())
+				os.Exit(1)
+			}
+			sampleMin = v
+			sampleMinSet = true
+			sampleMode = true
+			continue
+		}
+		if strings.HasPrefix(arg, "--sample-max=") {
+			v, err := parseSampleValue(strings.TrimPrefix(arg, "--sample-max="), "--sample-max")
+			if err != nil {
+				fmt.Println(err.Error())
+				os.Exit(1)
+			}
+			sampleMax = v
+			sampleMaxSet = true
+			sampleMode = true
 			continue
 		}
 
@@ -73,7 +132,7 @@ func main() {
 				command = "write"
 				if i+1 < len(args) {
 					writeTarget = args[i+1]
-					skipNext = true
+					i++
 				}
 				continue
 			}
@@ -84,6 +143,25 @@ func main() {
 		}
 
 		filePaths = append(filePaths, arg)
+	}
+
+	if sampleMode {
+		if sampleMinSet && !sampleMaxSet {
+			sampleMax = sampleMin
+		} else if sampleMaxSet && !sampleMinSet {
+			sampleMin = sampleMax
+		} else {
+			if !sampleMinSet {
+				sampleMin = 2
+			}
+			if !sampleMaxSet {
+				sampleMax = 3
+			}
+		}
+		if sampleMin < 1 || sampleMax < 1 || sampleMax < sampleMin {
+			fmt.Println("Error: Invalid sample range. Ensure --sample-min >= 1 and --sample-max >= --sample-min")
+			os.Exit(1)
+		}
 	}
 
 	switch command {
@@ -166,25 +244,31 @@ func main() {
 			}
 
 			// Local filesystem mode
-			err := filepath.WalkDir(startPath, func(p string, d os.DirEntry, err error) error {
-				if err != nil {
-					fmt.Printf("Skipping %s: %v\n", p, err)
-					return nil
+			if sampleMode {
+				if err := sampleLocal(startPath, sb, repoRoot, ign, includeIgnored, sampleMin, sampleMax); err != nil {
+					fmt.Printf("Error sampling %s: %v\n", startPath, err)
 				}
-				if !includeIgnored && isIgnored(repoRoot, ign, p) {
-					if d.IsDir() {
-						return filepath.SkipDir
+			} else {
+				err := filepath.WalkDir(startPath, func(p string, d os.DirEntry, err error) error {
+					if err != nil {
+						fmt.Printf("Skipping %s: %v\n", p, err)
+						return nil
 					}
+					if !includeIgnored && isIgnored(repoRoot, ign, p) {
+						if d.IsDir() {
+							return filepath.SkipDir
+						}
+						return nil
+					}
+					if d.IsDir() {
+						return nil
+					}
+					processFile(p, sb)
 					return nil
+				})
+				if err != nil {
+					fmt.Printf("Error walking %s: %v\n", startPath, err)
 				}
-				if d.IsDir() {
-					return nil
-				}
-				processFile(p, sb)
-				return nil
-			})
-			if err != nil {
-				fmt.Printf("Error walking %s: %v\n", startPath, err)
 			}
 		}
 		return nil
@@ -323,6 +407,120 @@ func processFile(p string, sb *strings.Builder) {
 	}
 }
 
+func parseSampleValue(raw string, flagName string) (int, error) {
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("Error: Invalid value for %s: %q", flagName, raw)
+	}
+	return v, nil
+}
+
+type fileEntry struct {
+	path string
+	abs  string
+}
+
+func sampleLocal(startPath string, sb *strings.Builder, repoRoot string, ign *gitignore.GitIgnore, includeIgnored bool, min, max int) error {
+	info, err := os.Stat(startPath)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		if !includeIgnored && isIgnored(repoRoot, ign, startPath) {
+			return nil
+		}
+		processFile(startPath, sb)
+		return nil
+	}
+
+	filesByDir := make(map[string][]fileEntry)
+	var allFiles []string
+
+	err = filepath.WalkDir(startPath, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			fmt.Printf("Skipping %s: %v\n", p, err)
+			return nil
+		}
+		if !includeIgnored && isIgnored(repoRoot, ign, p) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		absPath, err := filepath.Abs(p)
+		if err != nil {
+			absPath = p
+		}
+		allFiles = append(allFiles, absPath)
+		dir := filepath.Dir(absPath)
+		filesByDir[dir] = append(filesByDir[dir], fileEntry{path: p, abs: absPath})
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(allFiles) > 0 {
+		sort.Strings(allFiles)
+		writeFileTree(startPath, allFiles, sb)
+	}
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	dirs := make([]string, 0, len(filesByDir))
+	for dir := range filesByDir {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+
+	for _, dir := range dirs {
+		entries := filesByDir[dir]
+		if len(entries) == 0 {
+			continue
+		}
+		selected := sampleEntries(entries, min, max, rng)
+		for _, entry := range selected {
+			processFile(entry.path, sb)
+		}
+	}
+
+	return nil
+}
+
+func writeFileTree(root string, filePaths []string, sb *strings.Builder) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		absRoot = root
+	}
+	sb.WriteString(fmt.Sprintf("filetree: %s\n", absRoot))
+	for _, p := range filePaths {
+		sb.WriteString(p)
+		sb.WriteString("\n")
+	}
+}
+
+func sampleEntries(entries []fileEntry, min, max int, rng *rand.Rand) []fileEntry {
+	count := len(entries)
+	if count == 0 {
+		return nil
+	}
+	target := min
+	if max > min {
+		target = rng.Intn(max-min+1) + min
+	}
+	if target > count {
+		target = count
+	}
+	out := make([]fileEntry, len(entries))
+	copy(out, entries)
+	rng.Shuffle(len(out), func(i, j int) {
+		out[i], out[j] = out[j], out[i]
+	})
+	return out[:target]
+}
+
 func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  pull <file/dir> ...                         Pull content to clipboard (recursive)")
@@ -337,6 +535,9 @@ func printUsage() {
 	fmt.Println("  --append                                    Append to clipboard instead of overwrite")
 	fmt.Println("  --prepend                                   Prepend to clipboard instead of overwrite")
 	fmt.Println("  --includeIgnore                             Include files that are ignored by .gitignore")
+	fmt.Println("  --sample                                    Sample 2-3 files per directory")
+	fmt.Println("  --sample-min <n>                            Minimum files per directory when sampling")
+	fmt.Println("  --sample-max <n>                            Maximum files per directory when sampling")
 	fmt.Println("")
 	fmt.Println("GitHub auth (recommended):")
 	fmt.Println("  export GITHUB_TOKEN=ghp_...   (or fine-grained token with repo read access)")

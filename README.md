@@ -21,6 +21,7 @@ It is designed for:
 - ➕ Append or prepend instead of overwriting
 - 🔄 Pipe clipboard content to stdout
 - ✍️ Write clipboard contents directly to a file
+- 🎯 Sample a few files per directory and include the full file tree
 
 ---
 
@@ -68,6 +69,21 @@ To include them:
 ```bash
 pull --includeIgnore src/
 ```
+
+---
+
+### Sample a directory tree
+
+Pull a small sample of files from each directory while still listing every file path:
+
+```bash
+pull . --sample
+pull . --sample --sample-min=3 --sample-max=10
+```
+
+Notes:
+- `--sample` defaults to 2–3 files per directory
+- The full file tree is included so you can see every file path
 
 ---
 
